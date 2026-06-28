@@ -5,10 +5,50 @@ use axum::{
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::postgres::Postgres;
+use tokio::sync::OnceCell;
 use tower::ServiceExt;
 use trailhost::{build_router, ws, AppState};
 
 const TEST_SECRET: &str = "test_jwt_secret_at_least_32_chars!!";
+
+// One shared container for all tests; each test gets its own database.
+static PG: OnceCell<testcontainers::ContainerAsync<Postgres>> = OnceCell::const_new();
+
+async fn create_test_pool() -> PgPool {
+    let container = PG
+        .get_or_init(|| async {
+            Postgres::default()
+                .start()
+                .await
+                .expect("failed to start postgres container")
+        })
+        .await;
+
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("postgres port");
+
+    // Create a unique database so tests are fully isolated
+    let base_url = format!("postgres://postgres:postgres@127.0.0.1:{}/postgres", port);
+    let root = PgPool::connect(&base_url).await.expect("root pool");
+    let db_name = format!("t{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+        .execute(&root)
+        .await
+        .expect("create test db");
+    root.close().await;
+
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{}/{}", port, db_name);
+    let pool = PgPool::connect(&url).await.expect("test pool");
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("migrations");
+    pool
+}
 
 fn make_state(pool: PgPool) -> AppState {
     AppState {
@@ -20,6 +60,9 @@ fn make_state(pool: PgPool) -> AppState {
 
 async fn read_json(body: Body) -> Value {
     let bytes = body.collect().await.unwrap().to_bytes();
+    if bytes.is_empty() {
+        return Value::Null;
+    }
     serde_json::from_slice(&bytes).unwrap()
 }
 
@@ -42,9 +85,9 @@ async fn post_json(app: axum::Router, uri: &str, body: Value) -> (StatusCode, Va
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
-#[sqlx::test(migrations = "./migrations")]
-async fn register_success(pool: PgPool) {
-    let app = build_router(make_state(pool));
+#[tokio::test]
+async fn register_success() {
+    let app = build_router(make_state(create_test_pool().await));
     let (status, body) = post_json(
         app,
         "/api/auth/register",
@@ -58,9 +101,9 @@ async fn register_success(pool: PgPool) {
     assert!(body["user_id"].is_string());
 }
 
-#[sqlx::test(migrations = "./migrations")]
-async fn register_duplicate_email(pool: PgPool) {
-    let app = build_router(make_state(pool));
+#[tokio::test]
+async fn register_duplicate_email() {
+    let app = build_router(make_state(create_test_pool().await));
     let payload = json!({ "email": "bob@example.com", "password": "password123" });
 
     let (s1, _) = post_json(app.clone(), "/api/auth/register", payload.clone()).await;
@@ -70,9 +113,9 @@ async fn register_duplicate_email(pool: PgPool) {
     assert_eq!(s2, StatusCode::CONFLICT);
 }
 
-#[sqlx::test(migrations = "./migrations")]
-async fn login_success(pool: PgPool) {
-    let app = build_router(make_state(pool));
+#[tokio::test]
+async fn login_success() {
+    let app = build_router(make_state(create_test_pool().await));
     let creds = json!({ "email": "carol@example.com", "password": "password123" });
 
     post_json(app.clone(), "/api/auth/register", creds.clone()).await;
@@ -82,9 +125,9 @@ async fn login_success(pool: PgPool) {
     assert!(body["access_token"].is_string());
 }
 
-#[sqlx::test(migrations = "./migrations")]
-async fn login_wrong_password(pool: PgPool) {
-    let app = build_router(make_state(pool));
+#[tokio::test]
+async fn login_wrong_password() {
+    let app = build_router(make_state(create_test_pool().await));
     post_json(
         app.clone(),
         "/api/auth/register",
@@ -102,9 +145,9 @@ async fn login_wrong_password(pool: PgPool) {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-#[sqlx::test(migrations = "./migrations")]
-async fn login_unknown_email(pool: PgPool) {
-    let app = build_router(make_state(pool));
+#[tokio::test]
+async fn login_unknown_email() {
+    let app = build_router(make_state(create_test_pool().await));
     let (status, _) = post_json(
         app,
         "/api/auth/login",
@@ -115,9 +158,9 @@ async fn login_unknown_email(pool: PgPool) {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-#[sqlx::test(migrations = "./migrations")]
-async fn refresh_token_works(pool: PgPool) {
-    let app = build_router(make_state(pool));
+#[tokio::test]
+async fn refresh_token_works() {
+    let app = build_router(make_state(create_test_pool().await));
     let (_, reg) = post_json(
         app.clone(),
         "/api/auth/register",
@@ -137,9 +180,9 @@ async fn refresh_token_works(pool: PgPool) {
     assert!(body["access_token"].is_string());
 }
 
-#[sqlx::test(migrations = "./migrations")]
-async fn refresh_with_invalid_token(pool: PgPool) {
-    let app = build_router(make_state(pool));
+#[tokio::test]
+async fn refresh_with_invalid_token() {
+    let app = build_router(make_state(create_test_pool().await));
     let (status, _) = post_json(
         app,
         "/api/auth/refresh",
@@ -190,9 +233,9 @@ async fn authed_get(app: axum::Router, uri: &str, token: &str) -> (StatusCode, V
     (status, json)
 }
 
-#[sqlx::test(migrations = "./migrations")]
-async fn history_batch_upsert_and_list(pool: PgPool) {
-    let app = build_router(make_state(pool));
+#[tokio::test]
+async fn history_batch_upsert_and_list() {
+    let app = build_router(make_state(create_test_pool().await));
     let token = register_and_login(app.clone(), "frank@example.com").await;
 
     let status = authed_post(
@@ -217,9 +260,9 @@ async fn history_batch_upsert_and_list(pool: PgPool) {
     assert_eq!(body.as_array().unwrap().len(), 2);
 }
 
-#[sqlx::test(migrations = "./migrations")]
-async fn history_batch_idempotent(pool: PgPool) {
-    let app = build_router(make_state(pool));
+#[tokio::test]
+async fn history_batch_idempotent() {
+    let app = build_router(make_state(create_test_pool().await));
     let token = register_and_login(app.clone(), "grace@example.com").await;
 
     let batch = json!({
@@ -237,9 +280,9 @@ async fn history_batch_idempotent(pool: PgPool) {
     assert_eq!(body.as_array().unwrap().len(), 1);
 }
 
-#[sqlx::test(migrations = "./migrations")]
-async fn history_search(pool: PgPool) {
-    let app = build_router(make_state(pool));
+#[tokio::test]
+async fn history_search() {
+    let app = build_router(make_state(create_test_pool().await));
     let token = register_and_login(app.clone(), "heidi@example.com").await;
 
     authed_post(
@@ -263,9 +306,9 @@ async fn history_search(pool: PgPool) {
     assert_eq!(entries[0]["url"], "https://rust-lang.org");
 }
 
-#[sqlx::test(migrations = "./migrations")]
-async fn history_delete(pool: PgPool) {
-    let app = build_router(make_state(pool));
+#[tokio::test]
+async fn history_delete() {
+    let app = build_router(make_state(create_test_pool().await));
     let token = register_and_login(app.clone(), "ivan@example.com").await;
 
     authed_post(
@@ -301,9 +344,9 @@ async fn history_delete(pool: PgPool) {
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
-#[sqlx::test(migrations = "./migrations")]
-async fn history_delete_other_users_entry(pool: PgPool) {
-    let app = build_router(make_state(pool));
+#[tokio::test]
+async fn history_delete_other_users_entry() {
+    let app = build_router(make_state(create_test_pool().await));
     let token_a = register_and_login(app.clone(), "judy@example.com").await;
     let token_b = register_and_login(app.clone(), "karl@example.com").await;
 
@@ -340,9 +383,9 @@ async fn history_delete_other_users_entry(pool: PgPool) {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-#[sqlx::test(migrations = "./migrations")]
-async fn unauthenticated_history_request(pool: PgPool) {
-    let app = build_router(make_state(pool));
+#[tokio::test]
+async fn unauthenticated_history_request() {
+    let app = build_router(make_state(create_test_pool().await));
     let res = app
         .oneshot(
             Request::builder()
@@ -357,9 +400,9 @@ async fn unauthenticated_history_request(pool: PgPool) {
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
 
-#[sqlx::test(migrations = "./migrations")]
-async fn health_endpoint(pool: PgPool) {
-    let app = build_router(make_state(pool));
+#[tokio::test]
+async fn health_endpoint() {
+    let app = build_router(make_state(create_test_pool().await));
     let res = app
         .oneshot(Request::builder().uri("/api/health").body(Body::empty()).unwrap())
         .await
