@@ -1,0 +1,13 @@
+# Rust
+backend/target/
+
+# Node
+extension/node_modules/
+extension/dist/
+
+# Env
+.env
+.env.dev
+
+# Docker volumes (if bind-mounted locally)
+postgres_data/
