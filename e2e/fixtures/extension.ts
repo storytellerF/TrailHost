@@ -1,4 +1,11 @@
-import { test as base, chromium, type BrowserContext, type Worker } from "@playwright/test";
+import {
+  test as base,
+  chromium,
+  type BrowserContext,
+  type TestInfo,
+  type Worker,
+} from "@playwright/test";
+import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -12,11 +19,23 @@ type ExtensionFixtures = {
   setStorage: (items: Record<string, string>) => Promise<void>;
 };
 
+async function deleteVideos(pages: ReturnType<BrowserContext["pages"]>) {
+  for (const page of pages) {
+    const video = page.video();
+    if (!video) continue;
+    const filePath = await video.path().catch(() => null);
+    if (filePath) await fs.unlink(filePath).catch(() => {});
+  }
+}
+
 export const test = base.extend<ExtensionFixtures>({
   context: [
-    async ({}, use) => {
+    async ({}, use, testInfo: TestInfo) => {
+      const videoDir = path.join(testInfo.outputDir, "videos");
+
       const context = await chromium.launchPersistentContext("", {
         headless: false,
+        recordVideo: { dir: videoDir },
         args: [
           // Chrome's new headless mode supports extensions; used in CI
           ...(process.env.CI ? ["--headless=new"] : []),
@@ -26,8 +45,19 @@ export const test = base.extend<ExtensionFixtures>({
           "--disable-dev-shm-usage",
         ],
       });
+
+      // Track every page ever opened (including ones closed mid-test)
+      const allPages = [...context.pages()];
+      context.on("page", (page) => allPages.push(page));
+
       await use(context);
+
       await context.close();
+
+      // retain-on-failure: delete videos when the test passed
+      if (testInfo.status === testInfo.expectedStatus) {
+        await deleteVideos(allPages);
+      }
     },
     { scope: "test" },
   ],
