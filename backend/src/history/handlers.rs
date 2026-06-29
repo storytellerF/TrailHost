@@ -18,7 +18,8 @@ pub async fn upsert_batch(
     sqlx::query(
         "INSERT INTO devices (id, user_id, name, last_seen_at)
          VALUES ($1, $2, $3, $4)
-         ON CONFLICT (id) DO UPDATE SET name = $3, last_seen_at = $4",
+         ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, last_seen_at = EXCLUDED.last_seen_at
+         WHERE devices.user_id = EXCLUDED.user_id",
     )
     .bind(req.device_id)
     .bind(user_id)
@@ -67,7 +68,8 @@ pub async fn list_history(
     let offset = params.offset.unwrap_or(0);
 
     let entries = if let Some(q) = &params.q {
-        let pattern = format!("%{}%", q);
+        let escaped = q.replace('\\', r"\\").replace('%', r"\%").replace('_', r"\_");
+        let pattern = format!("%{}%", escaped);
         sqlx::query_as(
             "SELECT * FROM history_entries
              WHERE user_id = $1 AND (url ILIKE $2 OR title ILIKE $2)

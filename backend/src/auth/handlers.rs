@@ -24,12 +24,11 @@ pub async fn register(
     .bind(&hash)
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        if e.to_string().contains("unique") {
+    .map_err(|e| match e {
+        sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23505") => {
             StatusCode::CONFLICT
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
         }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
     })?;
 
     build_auth_response(user_id, &state.jwt_secret)

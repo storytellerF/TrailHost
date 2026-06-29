@@ -1,4 +1,4 @@
-import { apiFetch, getTokens } from "../api/client";
+import { apiFetch, getTokens, refreshAccessToken } from "../api/client";
 
 const DEVICE_ID_KEY = "trailhost_device_id";
 const BATCH_KEY = "trailhost_pending_batch";
@@ -40,8 +40,6 @@ async function flushBatch() {
   const batch: PendingEntry[] = (r[BATCH_KEY] as PendingEntry[]) ?? [];
   if (batch.length === 0) return;
 
-  await chrome.storage.local.remove(BATCH_KEY);
-
   try {
     const deviceId = r[DEVICE_ID_KEY] as string;
     const dnResult = await chrome.storage.local.get("device_name") as Record<string, string>;
@@ -57,26 +55,42 @@ async function flushBatch() {
         })),
       }),
     });
-    if (!res.ok) {
-      // Re-enqueue on failure
-      const er = await chrome.storage.local.get(BATCH_KEY) as Record<string, PendingEntry[]>;
-      const existing: PendingEntry[] = er[BATCH_KEY] ?? [];
-      await chrome.storage.local.set({ [BATCH_KEY]: [...batch, ...existing] });
+    if (res.ok) {
+      // Remove only the confirmed-sent entries; keep any added during the request
+      const sent = new Set(batch.map((e) => `${e.url}|${e.visit_time}`));
+      const after = await chrome.storage.local.get(BATCH_KEY) as Record<string, PendingEntry[]>;
+      const remaining = (after[BATCH_KEY] ?? []).filter(
+        (e) => !sent.has(`${e.url}|${e.visit_time}`)
+      );
+      if (remaining.length > 0) {
+        await chrome.storage.local.set({ [BATCH_KEY]: remaining });
+      } else {
+        await chrome.storage.local.remove(BATCH_KEY);
+      }
     }
+    // On non-ok response, leave batch in storage for next flush
   } catch {
-    const er = await chrome.storage.local.get(BATCH_KEY) as Record<string, PendingEntry[]>;
-    const existing: PendingEntry[] = er[BATCH_KEY] ?? [];
-    await chrome.storage.local.set({
-      [BATCH_KEY]: [...batch, ...existing],
-    });
+    // Network error: leave batch in storage for next flush
   }
 }
 
 // ── WebSocket ──────────────────────────────────────────────────────────────
 
 async function connectWs() {
-  const { accessToken } = await getTokens();
+  let { accessToken } = await getTokens();
   if (!accessToken) return;
+
+  // Refresh the token proactively if it is expired or within 60 s of expiry
+  try {
+    const exp = JSON.parse(atob(accessToken.split(".")[1])).exp as number;
+    if (exp * 1000 - Date.now() < 60_000) {
+      const fresh = await refreshAccessToken();
+      if (!fresh) return;
+      accessToken = fresh;
+    }
+  } catch {
+    // Malformed JWT — proceed with the existing token
+  }
 
   const r = await chrome.storage.local.get("trailhost_base_url") as Record<string, string>;
   const base: string = r["trailhost_base_url"] ?? "";
@@ -131,7 +145,7 @@ chrome.history.onVisited.addListener(async (result) => {
   await enqueuEntry({
     url: result.url,
     title: result.title ?? "",
-    visit_time: new Date().toISOString(),
+    visit_time: new Date(result.lastVisitTime ?? Date.now()).toISOString(),
   });
 });
 
@@ -142,7 +156,11 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 chrome.runtime.onInstalled.addListener(async () => {
   await getDeviceId();
-  await syncExistingHistory();
+  // Only sync if already authenticated; auth_changed will trigger sync on first login
+  const { accessToken } = await getTokens();
+  if (accessToken) {
+    await syncExistingHistory();
+  }
   await connectWs();
 });
 

@@ -3,7 +3,8 @@ use axum::{
         ws::{Message, WebSocket},
         Query, State, WebSocketUpgrade,
     },
-    response::Response,
+    http::StatusCode,
+    response::{IntoResponse, Response},
 };
 use serde::Deserialize;
 use std::{
@@ -50,15 +51,13 @@ pub async fn ws_handler(
     let claims = verify_token(&q.token, &state.jwt_secret, "access");
     match claims {
         Ok(c) => ws.on_upgrade(move |socket| handle_socket(socket, c.sub, state)),
-        Err(_) => ws.on_upgrade(|socket| async move {
-            let _ = socket.close().await;
-        }),
+        Err(_) => StatusCode::UNAUTHORIZED.into_response(),
     }
 }
 
 async fn handle_socket(mut socket: WebSocket, user_id: Uuid, state: AppState) {
     let rx = {
-        let mut hub = state.ws_hub.lock().unwrap();
+        let Ok(mut hub) = state.ws_hub.lock() else { return };
         let tx = hub
             .entry(user_id)
             .or_insert_with(|| broadcast::channel(64).0)
@@ -79,6 +78,16 @@ async fn handle_socket(mut socket: WebSocket, user_id: Uuid, state: AppState) {
                     Some(Ok(_)) => {}
                     _ => break,
                 }
+            }
+        }
+    }
+
+    // Remove the hub entry when the last subscriber for this user disconnects
+    drop(rx);
+    if let Ok(mut hub) = state.ws_hub.lock() {
+        if let Some(tx) = hub.get(&user_id) {
+            if tx.receiver_count() == 0 {
+                hub.remove(&user_id);
             }
         }
     }

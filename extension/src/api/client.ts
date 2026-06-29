@@ -33,7 +33,7 @@ export async function clearTokens() {
   await chrome.storage.local.remove([ACCESS_TOKEN_KEY, REFRESH_TOKEN_KEY]);
 }
 
-async function refreshAccessToken(): Promise<string | null> {
+export async function refreshAccessToken(): Promise<string | null> {
   const { refreshToken } = await getTokens();
   if (!refreshToken) return null;
   const base = await getBaseUrl();
