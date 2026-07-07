@@ -1,4 +1,11 @@
 import { apiFetch, getTokens, refreshAccessToken } from "../api/client";
+import {
+  getSyncBadgeColor,
+  getSyncBadgeText,
+  getSyncBadgeTitle,
+  isBadgeVisible,
+  type SyncBadgeState,
+} from "./badge";
 
 const DEVICE_ID_KEY = "trailhost_device_id";
 const BATCH_KEY = "trailhost_pending_batch";
@@ -6,6 +13,9 @@ const FLUSH_ALARM = "trailhost_flush";
 const WS_RECONNECT_DELAY_MS = 5000;
 
 let ws: WebSocket | null = null;
+let syncActivityCount = 0;
+let flushPromise: Promise<void> | null = null;
+let badgeUpdateChain: Promise<void> = Promise.resolve();
 
 // ── Device ID ──────────────────────────────────────────────────────────────
 
@@ -25,14 +35,65 @@ interface PendingEntry {
   visit_time: string;
 }
 
+async function getPendingCount(): Promise<number> {
+  const r = await chrome.storage.local.get(BATCH_KEY) as Record<string, PendingEntry[]>;
+  return (r[BATCH_KEY] ?? []).length;
+}
+
+async function updateBadge() {
+  const next = badgeUpdateChain.then(async () => {
+    const state: SyncBadgeState = {
+      pendingCount: await getPendingCount(),
+      syncing: syncActivityCount > 0,
+    };
+
+    if (!isBadgeVisible(state)) {
+      await chrome.action.setBadgeText({ text: "" });
+      await chrome.action.setTitle({ title: "TrailHost" });
+      return;
+    }
+
+    await chrome.action.setBadgeBackgroundColor({
+      color: getSyncBadgeColor(state),
+    });
+    await chrome.action.setBadgeText({
+      text: getSyncBadgeText(state),
+    });
+    await chrome.action.setTitle({
+      title: getSyncBadgeTitle(state),
+    });
+  });
+
+  badgeUpdateChain = next.then(
+    () => undefined,
+    () => undefined
+  );
+  return next;
+}
+
+async function withSyncActivity<T>(task: () => Promise<T>): Promise<T> {
+  syncActivityCount += 1;
+  await updateBadge();
+  try {
+    return await task();
+  } finally {
+    syncActivityCount = Math.max(0, syncActivityCount - 1);
+    await updateBadge();
+  }
+}
+
 async function enqueuEntry(entry: PendingEntry) {
   const r = await chrome.storage.local.get(BATCH_KEY) as Record<string, PendingEntry[]>;
   const batch: PendingEntry[] = r[BATCH_KEY] ?? [];
   batch.push(entry);
   await chrome.storage.local.set({ [BATCH_KEY]: batch });
+  await updateBadge();
 }
 
 async function flushBatch() {
+  if (flushPromise) return flushPromise;
+
+  flushPromise = withSyncActivity(async () => {
   const { accessToken } = await getTokens();
   if (!accessToken) return;
 
@@ -67,10 +128,18 @@ async function flushBatch() {
       } else {
         await chrome.storage.local.remove(BATCH_KEY);
       }
+      await updateBadge();
     }
     // On non-ok response, leave batch in storage for next flush
   } catch {
     // Network error: leave batch in storage for next flush
+  }
+  });
+
+  try {
+    return await flushPromise;
+  } finally {
+    flushPromise = null;
   }
 }
 
@@ -121,21 +190,23 @@ async function connectWs() {
 // ── Init sync from existing browser history ────────────────────────────────
 
 async function syncExistingHistory() {
-  const items = await chrome.history.search({
-    text: "",
-    startTime: Date.now() - 7 * 24 * 60 * 60 * 1000,
-    maxResults: 500,
-  });
-
-  for (const item of items) {
-    if (!item.url) continue;
-    await enqueuEntry({
-      url: item.url,
-      title: item.title ?? "",
-      visit_time: new Date(item.lastVisitTime ?? Date.now()).toISOString(),
+  await withSyncActivity(async () => {
+    const items = await chrome.history.search({
+      text: "",
+      startTime: Date.now() - 7 * 24 * 60 * 60 * 1000,
+      maxResults: 500,
     });
-  }
-  await flushBatch();
+
+    for (const item of items) {
+      if (!item.url) continue;
+      await enqueuEntry({
+        url: item.url,
+        title: item.title ?? "",
+        visit_time: new Date(item.lastVisitTime ?? Date.now()).toISOString(),
+      });
+    }
+    await flushBatch();
+  });
 }
 
 // ── Event listeners ────────────────────────────────────────────────────────
@@ -162,20 +233,23 @@ chrome.runtime.onInstalled.addListener(async () => {
     await syncExistingHistory();
   }
   await connectWs();
+  await updateBadge();
 });
 
 chrome.runtime.onStartup.addListener(async () => {
   await connectWs();
   await flushBatch();
+  await updateBadge();
 });
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === "auth_changed") {
     if (msg.loggedIn) {
-      connectWs();
-      syncExistingHistory();
+      void connectWs();
+      void syncExistingHistory();
     } else {
       ws?.close();
     }
+    void updateBadge();
   }
 });

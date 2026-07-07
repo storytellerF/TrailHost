@@ -50,6 +50,12 @@ vi.stubGlobal("chrome", {
     create: vi.fn(),
     onAlarm: { addListener: vi.fn() },
   },
+  action: {
+    setBadgeText: vi.fn().mockResolvedValue(undefined),
+    setBadgeBackgroundColor: vi.fn().mockResolvedValue(undefined),
+    setBadgeTextColor: vi.fn().mockResolvedValue(undefined),
+    setTitle: vi.fn().mockResolvedValue(undefined),
+  },
 });
 
 beforeEach(() => {
