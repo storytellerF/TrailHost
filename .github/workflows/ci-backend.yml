@@ -11,7 +11,7 @@ jobs:
     name: Backend Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -21,7 +21,7 @@ jobs:
 
       - name: Restore testcontainers Docker image cache
         id: docker-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /tmp/docker-cache
           key: docker-${{ runner.os }}-testcontainers-${{ hashFiles('backend/Cargo.lock') }}
