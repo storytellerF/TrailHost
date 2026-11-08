@@ -6,14 +6,16 @@ use axum::{
 use chrono::Utc;
 use uuid::Uuid;
 
-use crate::{ws::broadcast, AppState, AuthUser};
 use super::models::{HistoryEntry, HistoryQuery, UpsertBatch};
+use crate::{ws::broadcast, AppState, AuthUser};
 
 pub async fn upsert_batch(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
     Json(req): Json<UpsertBatch>,
 ) -> Result<StatusCode, StatusCode> {
+    let mut tx = state.db.begin().await.map_err(batch_db_error)?;
+
     // Upsert device
     sqlx::query(
         "INSERT INTO devices (id, user_id, name, last_seen_at)
@@ -25,9 +27,9 @@ pub async fn upsert_batch(
     .bind(user_id)
     .bind(&req.device_name)
     .bind(Utc::now())
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(batch_db_error)?;
 
     let mut inserted: Vec<HistoryEntry> = Vec::new();
 
@@ -35,7 +37,7 @@ pub async fn upsert_batch(
         let row: Option<HistoryEntry> = sqlx::query_as(
             "INSERT INTO history_entries (user_id, device_id, url, title, visit_time)
              VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (user_id, url, visit_time) DO NOTHING
+             ON CONFLICT (user_id, url_sha256, visit_time) DO NOTHING
              RETURNING *",
         )
         .bind(user_id)
@@ -43,14 +45,16 @@ pub async fn upsert_batch(
         .bind(&item.url)
         .bind(&item.title)
         .bind(item.visit_time)
-        .fetch_optional(&state.db)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(batch_db_error)?;
 
         if let Some(entry) = row {
             inserted.push(entry);
         }
     }
+
+    tx.commit().await.map_err(batch_db_error)?;
 
     if !inserted.is_empty() {
         broadcast(&state.ws_hub, user_id, &inserted);
@@ -59,6 +63,12 @@ pub async fn upsert_batch(
     Ok(StatusCode::NO_CONTENT)
 }
 
+fn batch_db_error(error: sqlx::Error) -> StatusCode {
+    // Database messages may contain URLs or other user data; log classifications only.
+    let code = error.as_database_error().and_then(|error| error.code());
+    tracing::error!(operation = "history_batch", sqlstate = ?code, error_kind = ?std::mem::discriminant(&error), "history batch database operation failed");
+    StatusCode::INTERNAL_SERVER_ERROR
+}
 pub async fn list_history(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
@@ -68,7 +78,10 @@ pub async fn list_history(
     let offset = params.offset.unwrap_or(0);
 
     let entries = if let Some(q) = &params.q {
-        let escaped = q.replace('\\', r"\\").replace('%', r"\%").replace('_', r"\_");
+        let escaped = q
+            .replace('\\', r"\\")
+            .replace('%', r"\%")
+            .replace('_', r"\_");
         let pattern = format!("%{}%", escaped);
         sqlx::query_as(
             "SELECT * FROM history_entries
@@ -103,14 +116,12 @@ pub async fn delete_entry(
     AuthUser(user_id): AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, StatusCode> {
-    let result = sqlx::query(
-        "DELETE FROM history_entries WHERE id = $1 AND user_id = $2",
-    )
-    .bind(id)
-    .bind(user_id)
-    .execute(&state.db)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let result = sqlx::query("DELETE FROM history_entries WHERE id = $1 AND user_id = $2")
+        .bind(id)
+        .bind(user_id)
+        .execute(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if result.rows_affected() == 0 {
         Err(StatusCode::NOT_FOUND)
