@@ -539,8 +539,8 @@ async fn history_batch_rolls_back_device_and_entries_without_broadcast() {
     let status = authed_post(app, "/api/history/batch", &token, json!({
         "device_id": device_id, "device_name": "Test Browser",
         "entries": [
-            {"url": "https://example.com/ok", "title": "ok", "visit_time": "2024-01-01T10:00:00Z"},
-            {"url": "https://example.com/fail", "title": "reject", "visit_time": "2024-01-01T11:00:00Z"}
+            {"url": "https://example.com/a-ok", "title": "ok", "visit_time": "2024-01-01T10:00:00Z"},
+            {"url": "https://example.com/z-fail", "title": "reject", "visit_time": "2024-01-01T11:00:00Z"}
         ]
     })).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -594,4 +594,74 @@ async fn history_digest_migration_preserves_existing_rows_and_deduplication() {
     );
     let result = sqlx::query("INSERT INTO history_entries (user_id, device_id, url, title, visit_time) VALUES ($1, $2, 'https://example.com/original', 'Retry', '2024-01-01T10:00:00Z') ON CONFLICT (user_id, url_sha256, visit_time) DO NOTHING").bind(user_id).bind(device_id).execute(&pool).await.unwrap();
     assert_eq!(result.rows_affected(), 0);
+}
+
+#[tokio::test]
+async fn history_batch_concurrent_reversed_entries_do_not_deadlock() {
+    let pool = create_test_pool().await;
+    let app = build_router(make_state(pool.clone()));
+    let token = register_and_login(app.clone(), "concurrent@example.com").await;
+    let gate = (uuid::Uuid::new_v4().as_u128() & i64::MAX as u128) as i64;
+    // Hold the first successful INSERT until both requests are waiting on locks.
+    // Without consistent ordering, each request owns a different unique key;
+    // releasing this gate then deterministically exposes the deadlock.
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "CREATE FUNCTION gate_history_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN PERFORM pg_advisory_xact_lock_shared({gate}); RETURN NEW; END $$;
+         CREATE TRIGGER gate_history_insert AFTER INSERT ON history_entries
+         FOR EACH ROW EXECUTE FUNCTION gate_history_insert();"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut coordinator = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(gate)
+        .execute(&mut *coordinator)
+        .await
+        .unwrap();
+    let a =
+        json!({"url": "https://example.com/a", "title": "A", "visit_time": "2024-01-01T10:00:00Z"});
+    let b =
+        json!({"url": "https://example.com/b", "title": "B", "visit_time": "2024-01-01T10:00:00Z"});
+    let first =
+        json!({"device_id": uuid::Uuid::new_v4(), "device_name": "First", "entries": [a, b]});
+    let second =
+        json!({"device_id": uuid::Uuid::new_v4(), "device_name": "Second", "entries": [b, a]});
+    let release_gate =
+        async {
+            let ready =
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        let waiting: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()
+                     AND wait_event_type = 'Lock' AND query LIKE 'INSERT INTO history_entries%'"
+                ).fetch_one(&mut *coordinator).await.unwrap();
+                        if waiting == 2 {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+            sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(gate)
+                .execute(&mut *coordinator)
+                .await
+                .unwrap();
+            ready.expect("both batches should reach the lock gate");
+        };
+    let (first_status, second_status, ()) = tokio::join!(
+        authed_post(app.clone(), "/api/history/batch", &token, first),
+        authed_post(app.clone(), "/api/history/batch", &token, second),
+        release_gate,
+    );
+    assert_eq!(first_status, StatusCode::NO_CONTENT);
+    assert_eq!(second_status, StatusCode::NO_CONTENT);
+    let (status, body) = authed_get(app, "/api/history", &token).await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = body.as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().any(|entry| entry["url"] == a["url"]));
+    assert!(entries.iter().any(|entry| entry["url"] == b["url"]));
 }

@@ -33,7 +33,12 @@ pub async fn upsert_batch(
 
     let mut inserted: Vec<HistoryEntry> = Vec::new();
 
-    for item in &req.entries {
+    // Overlapping batches must acquire unique-key locks in the same order.
+    // Stable sorting also preserves first-entry-wins behavior for duplicates.
+    let mut entries: Vec<_> = req.entries.iter().collect();
+    entries.sort_by(|a, b| a.url.cmp(&b.url).then(a.visit_time.cmp(&b.visit_time)));
+
+    for item in entries {
         let row: Option<HistoryEntry> = sqlx::query_as(
             "INSERT INTO history_entries (user_id, device_id, url, title, visit_time)
              VALUES ($1, $2, $3, $4, $5)
