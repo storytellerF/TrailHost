@@ -154,16 +154,16 @@ for (const scheme of ["light", "dark"] as const) {
 }
 
 for (const scheme of ["light", "dark"] as const) {
-  test(`logged-out popup and history splash follow ${scheme}`, async ({ context, extensionId }, testInfo) => {
-    for (const surface of ["popup", "history-page"]) {
+  for (const surface of ["popup", "history-page"]) {
+    test(`logged-out ${surface} follows ${scheme}`, async ({ context, extensionId }, testInfo) => {
       const page = await context.newPage();
       await page.emulateMedia({ colorScheme: scheme });
       await page.goto(`chrome-extension://${extensionId}/src/${surface}/index.html`);
       await expect(page.getByText(surface === "popup" ? "登录 / 注册" : "Not logged in", { exact: true })).toBeVisible();
       await checkTheme(page, scheme);
       await auditText(page, testInfo, surface);
-    }
-  });
+    });
+  }
 
   test(`empty history follows ${scheme}`, async ({ context, extensionId, setStorage }, testInfo) => {
     await setStorage({
@@ -181,11 +181,11 @@ for (const scheme of ["light", "dark"] as const) {
   });
 }
 
-test("pages use the browser preference without a page theme override", async ({ context, extensionId }) => {
-  for (const surface of ["popup", "history-page", "auth-page"]) {
+for (const surface of ["popup", "history-page", "auth-page"]) {
+  test(`${surface} uses the browser preference without a page theme override`, async ({ context, extensionId }) => {
     const page = await context.newPage();
     await page.goto(`chrome-extension://${extensionId}/src/${surface}/index.html`);
     const dark = await page.evaluate(() => matchMedia("(prefers-color-scheme: dark)").matches);
     await checkTheme(page, dark ? "dark" : "light");
-  }
-});
+  });
+}
